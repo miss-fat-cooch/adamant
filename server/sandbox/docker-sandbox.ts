@@ -5,7 +5,16 @@ import * as os from 'node:os'
 import type { SandboxExecutionOptions, SandboxResult, SpawnFunction } from './types.ts'
 
 const MAX_BUFFER_BYTES = 512 * 1024 // 512KB bounded tail
-const FORBIDDEN_SECRET_KEYS = ['TOKEN', 'SECRET', 'KEY', 'AUTH', 'PASS', 'CREDENTIAL']
+const FORBIDDEN_SECRET_KEYS = [
+  'TOKEN',
+  'SECRET',
+  'KEY',
+  'AUTH',
+  'PASS',
+  'PASSWORD',
+  'CREDENTIAL',
+  'COOKIE',
+]
 
 export class DockerSandbox {
   private defaultImage: string
@@ -32,7 +41,7 @@ export class DockerSandbox {
         stdout: '',
         stderr: `Invalid workspacePath: "${options.workspacePath}". Path must be absolute to prevent named-volume creation.`,
         timedOut: false,
-        durationMs: 0,
+        durationMs: Date.now() - startTime,
         reason: 'INVALID_WORKSPACE',
       }
     }
@@ -44,7 +53,33 @@ export class DockerSandbox {
         stdout: '',
         stderr: `Workspace path does not exist: "${options.workspacePath}".`,
         timedOut: false,
-        durationMs: 0,
+        durationMs: Date.now() - startTime,
+        reason: 'INVALID_WORKSPACE',
+      }
+    }
+
+    try {
+      const stats = fs.statSync(options.workspacePath)
+      if (!stats.isDirectory()) {
+        return {
+          success: false,
+          exitCode: null,
+          stdout: '',
+          stderr: `Workspace path is not a directory: "${options.workspacePath}".`,
+          timedOut: false,
+          durationMs: Date.now() - startTime,
+          reason: 'INVALID_WORKSPACE',
+        }
+      }
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      return {
+        success: false,
+        exitCode: null,
+        stdout: '',
+        stderr: `Failed to inspect workspace path: ${errMsg}`,
+        timedOut: false,
+        durationMs: Date.now() - startTime,
         reason: 'INVALID_WORKSPACE',
       }
     }
@@ -60,6 +95,16 @@ export class DockerSandbox {
     const containerName = `adamant-sb-${runId}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`
 
     const resolvedPath = path.resolve(options.workspacePath)
+
+    let targetWorkdir = '/workspace'
+    if (options.workdir && options.workdir.trim()) {
+      const rel = options.workdir.trim().replace(/\\/g, '/').replace(/^\/+/, '')
+      const posixTarget = path.posix.normalize(path.posix.join('/workspace', rel))
+      if (posixTarget === '/workspace' || posixTarget.startsWith('/workspace/')) {
+        targetWorkdir = posixTarget
+      }
+    }
+
     const dockerArgs: string[] = [
       'run',
       '--rm',
@@ -84,7 +129,7 @@ export class DockerSandbox {
       '--mount',
       `type=bind,src=${resolvedPath},dst=/workspace`,
       '-w',
-      '/workspace',
+      targetWorkdir,
     ]
 
     let envFilePath: string | null = null
@@ -93,7 +138,8 @@ export class DockerSandbox {
       for (const [key, val] of Object.entries(options.env)) {
         const isSecret = FORBIDDEN_SECRET_KEYS.some((f) => key.toUpperCase().includes(f))
         if (!isSecret) {
-          safeLines.push(`${key}=${val}`)
+          const sanitizedVal = val.replace(/[\r\n]+/g, ' ')
+          safeLines.push(`${key}=${sanitizedVal}`)
         }
       }
       if (safeLines.length > 0) {
