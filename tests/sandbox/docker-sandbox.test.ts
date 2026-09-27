@@ -200,4 +200,78 @@ describe('DockerSandbox', () => {
     assert.ok(result.stdout.length <= 512 * 1024)
     assert.ok(result.stdout.length > 0)
   })
+
+  it('rejects a workspacePath that is a file rather than a directory', async () => {
+    const tmpFile = path.join(os.tmpdir(), `adamant-file-${Date.now()}.tmp`)
+    fs.writeFileSync(tmpFile, 'test')
+
+    try {
+      const sandbox = new DockerSandbox()
+      const result = await sandbox.run({
+        workspacePath: tmpFile,
+        command: 'true',
+      })
+
+      assert.strictEqual(result.success, false)
+      assert.strictEqual(result.reason, 'INVALID_WORKSPACE')
+      assert.match(result.stderr, /is not a directory/)
+    } finally {
+      if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile)
+    }
+  })
+
+  it('sanitizes multiline environment variable values', async () => {
+    let envFile = ''
+    const mockSpawn: SpawnFunction = (_cmd, args) => {
+      const flag = args.indexOf('--env-file')
+      const file = flag === -1 ? undefined : args[flag + 1]
+      if (file) envFile = fs.readFileSync(file, 'utf8')
+      return closeSoon(createMockProcess())
+    }
+
+    const sandbox = new DockerSandbox({ spawnFn: mockSpawn })
+    const result = await sandbox.run({
+      workspacePath: process.cwd(),
+      command: 'true',
+      env: {
+        MULTI: 'first\nsecond\r\nthird',
+        DB_PASSWORD: 'secretpassword',
+        AUTH_COOKIE: 'token123',
+      },
+    })
+
+    assert.strictEqual(result.success, true)
+    assert.match(envFile, /^MULTI=first second third$/m)
+    assert.doesNotMatch(envFile, /DB_PASSWORD/)
+    assert.doesNotMatch(envFile, /AUTH_COOKIE/)
+    assert.doesNotMatch(envFile, /secretpassword/)
+  })
+
+  it('sets custom workdir inside workspace and blocks path traversal', async () => {
+    let capturedArgs: string[] = []
+    const mockSpawn: SpawnFunction = (_cmd, args) => {
+      capturedArgs = args
+      return closeSoon(createMockProcess())
+    }
+
+    const sandbox = new DockerSandbox({ spawnFn: mockSpawn })
+
+    await sandbox.run({
+      workspacePath: process.cwd(),
+      workdir: 'packages/app',
+      command: 'pnpm test',
+    })
+    const wIndex1 = capturedArgs.indexOf('-w')
+    assert.notStrictEqual(wIndex1, -1)
+    assert.strictEqual(capturedArgs[wIndex1 + 1], '/workspace/packages/app')
+
+    await sandbox.run({
+      workspacePath: process.cwd(),
+      workdir: '../../etc',
+      command: 'pnpm test',
+    })
+    const wIndex2 = capturedArgs.indexOf('-w')
+    assert.notStrictEqual(wIndex2, -1)
+    assert.strictEqual(capturedArgs[wIndex2 + 1], '/workspace')
+  })
 })

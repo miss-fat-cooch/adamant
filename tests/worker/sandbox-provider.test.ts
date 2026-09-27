@@ -27,7 +27,7 @@ function fakeDocker(results: readonly SandboxResult[]) {
 
 const provider = (
   results: readonly SandboxResult[],
-  overrides: { installCommand?: string } = {},
+  overrides: { installCommand?: string; workdir?: string } = {},
 ) => {
   const { seen, sandbox } = fakeDocker(results)
   return {
@@ -127,5 +127,14 @@ describe('sandbox provider', () => {
     const outcome = await sandbox.runValidation({ attemptNumber: 1, candidateHash: 'hash' })
 
     assert.ok(outcome.output.length <= 16_000)
+  })
+
+  it('passes workdir option through to docker sandbox run calls', async () => {
+    const { seen, provider: sandbox } = provider([ok, ok], { workdir: 'packages/backend' })
+
+    await sandbox.runValidation({ attemptNumber: 1, candidateHash: 'hash' })
+
+    assert.equal(seen[0]?.workdir, 'packages/backend')
+    assert.equal(seen[1]?.workdir, 'packages/backend')
   })
 })

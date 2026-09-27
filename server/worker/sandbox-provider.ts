@@ -13,6 +13,7 @@ import { type SandboxExecutionOptions, type SandboxResult } from '../sandbox/typ
 export interface SandboxRunnerOptions {
   readonly runId: string
   readonly workspacePath: string
+  readonly workdir?: string
   /** Run once before the test command, with the network on. Skipped when empty. */
   readonly installCommand?: string
   readonly testCommand: string
@@ -51,6 +52,7 @@ export function createDockerSandboxProvider(options: SandboxRunnerOptions): Sand
     docker.run({
       runId: options.runId,
       workspacePath: options.workspacePath,
+      ...(options.workdir ? { workdir: options.workdir } : {}),
       command,
       ...(options.image === undefined ? {} : { image: options.image }),
       ...extra,
