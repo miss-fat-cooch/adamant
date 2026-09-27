@@ -1,0 +1,51 @@
+name: CodeRabbit Review Gate
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+concurrency:
+  group: coderabbit-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# This workflow only inspects review metadata. It never checks out or executes
+# pull-request code, including code from forks.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review:
+    name: Review current commit
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require a completed CodeRabbit review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          reviews="$(gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews")"
+
+          if jq -e --arg sha "$PR_HEAD_SHA" '
+            add | any(.[];
+              .user.login == "coderabbitai[bot]" and
+              .commit_id == $sha and
+              (.state == "APPROVED" or
+               .state == "CHANGES_REQUESTED" or
+               .state == "COMMENTED")
+            )
+          ' <<<"$reviews" >/dev/null; then
+            echo "CodeRabbit reviewed ${PR_HEAD_SHA}."
+            exit 0
+          fi
+
+          echo "CodeRabbit has not completed a review of ${PR_HEAD_SHA}."
+          echo "Wait for the automatic review or comment '@coderabbitai review'."
+          exit 1
