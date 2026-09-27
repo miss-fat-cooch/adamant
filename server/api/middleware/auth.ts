@@ -1,40 +1,58 @@
 import type { Context, Next } from 'hono'
-import { timingSafeEqual } from 'node:crypto'
 
-/** Same shape either way, so length alone cannot short-circuit the compare. */
-function safeEqual(a: string, b: string): boolean {
-  const bufA = Buffer.from(a)
-  const bufB = Buffer.from(b)
-  return bufA.length === bufB.length && timingSafeEqual(bufA, bufB)
+import { createDb } from '../../db/client.ts'
+import { authenticateSession } from '../services/authService.ts'
+
+export type AuthVariables = {
+  userId: string
+  sessionId: string
 }
 
-export type AuthVariables = { userId: string }
+let db: ReturnType<typeof createDb> | undefined
 
-/**
- * Phase 1 User Authentication:
- * The CLI sends ADAMANT_SESSION in the header (or query param for SSE).
- * We compare it against the seeded ADAMANT_SESSION_SECRET.
- */
+function getDb() {
+  if (!db) {
+    const databaseUrl = process.env.DATABASE_URL
+
+    if (!databaseUrl) {
+      throw new Error('DATABASE_URL is required for session authentication')
+    }
+
+    db = createDb(databaseUrl)
+  }
+
+  return db
+}
+
 export async function authMiddleware(c: Context, next: Next) {
   const sessionHeader = c.req.header('ADAMANT_SESSION')
   const sessionQuery = c.req.query('session')
+
   const token = sessionHeader ?? sessionQuery
-  const validToken = process.env.ADAMANT_SESSION_SECRET
 
-  if (!validToken) {
-    console.warn('ADAMANT_SESSION_SECRET is not configured!')
-    return c.json({ error: 'Server misconfiguration' }, 500)
-  }
-
-  if (!token || !safeEqual(token, validToken)) {
+  if (!token) {
     return c.json({ error: 'Unauthorized' }, 401)
   }
 
-  const userId = process.env.ADAMANT_SEED_USER_ID
-  if (!userId) {
+  try {
+    const database = getDb()
+    const session = await authenticateSession(database, token)
+
+    if (!session) {
+      return c.json({ error: 'Unauthorized' }, 401)
+    }
+
+    c.set('userId', session.userId)
+    c.set('sessionId', session.sessionId)
+
+    await next()
+  } catch (error) {
+    console.error(
+      error instanceof Error
+        ? error.message
+        : 'Failed to authenticate session',
+    )
+
     return c.json({ error: 'Server misconfiguration' }, 500)
   }
-  c.set('userId', userId)
-
-  await next()
 }

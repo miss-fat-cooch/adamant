@@ -1,7 +1,9 @@
 import { Hono } from 'hono'
+
 import { createApp, resourceNames } from './app.ts'
 import { authMiddleware } from './middleware/auth.ts'
 import { activity } from './routes/activity.ts'
+import { auth } from './routes/auth.ts'
 import { createRunsRoute } from './routes/runs.ts'
 import { type RunApiStore } from './services/runStore.ts'
 import { github } from './webhooks/github.ts'
@@ -21,13 +23,18 @@ export function createServerApp(runStore?: RunApiStore) {
     app.use(`/${name}`, authMiddleware)
     app.use(`/${name}/*`, authMiddleware)
   }
+
   app.use('/activity', authMiddleware)
   app.use('/activity/*', authMiddleware)
 
   if (runStore || process.env.DATABASE_URL) {
     app.route('/runs', createRunsRoute(runStore))
   }
+
+  app.route('/auth', auth)
+
   createApp(undefined, app)
+
   app.route('/webhooks/github', github)
   app.route('/activity', activity)
 
