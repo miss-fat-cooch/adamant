@@ -36,6 +36,7 @@ export interface SandboxSettings {
   readonly image: string
   readonly installCommand: string
   readonly testCommand: string
+  readonly workdir?: string
 }
 
 export function readSandboxSettings(env = process.env): SandboxSettings {
@@ -43,6 +44,7 @@ export function readSandboxSettings(env = process.env): SandboxSettings {
     image: env.ADAMANT_SANDBOX_IMAGE ?? 'node:22-bookworm-slim',
     installCommand: env.ADAMANT_SANDBOX_INSTALL ?? 'npm ci --no-audit --no-fund',
     testCommand: env.ADAMANT_SANDBOX_TEST ?? 'npm test',
+    ...(env.ADAMANT_SANDBOX_WORKDIR ? { workdir: env.ADAMANT_SANDBOX_WORKDIR } : {}),
   }
 }
 
@@ -119,6 +121,7 @@ export function createRunProviders(options: RunProviderOptions): RunProviders {
       image: settings.image,
       installCommand: settings.installCommand,
       testCommand: settings.testCommand,
+      ...(settings.workdir ? { workdir: settings.workdir } : {}),
     }),
     recorder,
     dispose: () => workspace.cleanup(),

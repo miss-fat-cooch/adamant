@@ -7,6 +7,8 @@ export interface SandboxExecutionOptions {
   runId?: string
   /** Absolute path to disposable workspace clone */
   workspacePath: string
+  /** Subdirectory inside workspace to set as working directory (e.g. "packages/app") */
+  workdir?: string
   /** Command to execute inside container */
   command: string
   /** Max execution time in milliseconds (default: 60000ms) */
