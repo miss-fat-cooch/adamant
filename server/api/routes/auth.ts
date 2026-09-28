@@ -1,5 +1,6 @@
 import { Hono } from 'hono'
-import { deleteCookie, setCookie } from 'hono/cookie'
+import { deleteCookie, getCookie, setCookie } from 'hono/cookie'
+import { timingSafeEqual } from 'node:crypto'
 
 import { type Db } from '../../db/client.ts'
 import {
@@ -18,6 +19,7 @@ import {
 } from '../services/authService.ts'
 
 const OAUTH_REQUEST_TIMEOUT_MS = 10_000
+const OAUTH_STATE_MAX_AGE_SECONDS = 15 * 60
 const SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 
 export type OAuthProviderConfig = {
@@ -50,7 +52,7 @@ async function createOAuthAuthorizationUrl(
   db: Db,
   config: OAuthConfig,
   provider: OAuthProvider,
-): Promise<string> {
+): Promise<{ state: string; url: string }> {
   const providerConfig = getProviderConfig(config, provider)
   const state = await createOAuthState(db, provider)
 
@@ -63,14 +65,33 @@ async function createOAuthAuthorizationUrl(
   if (provider === 'github') {
     params.set('scope', 'read:user user:email')
 
-    return `https://github.com/login/oauth/authorize?${params.toString()}`
+    return { state, url: `https://github.com/login/oauth/authorize?${params.toString()}` }
   }
 
   params.set('response_type', 'code')
   params.set('scope', 'openid email profile')
   params.set('access_type', 'offline')
 
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`
+  return { state, url: `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}` }
+}
+
+function oauthStateCookieName(provider: OAuthProvider): string {
+  return `adamant_oauth_${provider}_state`
+}
+
+function oauthStateCookiePath(provider: OAuthProvider): string {
+  return `/auth/${provider}/callback`
+}
+
+function matchesBrowserState(browserState: string | undefined, callbackState: string): boolean {
+  if (!browserState) return false
+
+  const browserStateBytes = Buffer.from(browserState)
+  const callbackStateBytes = Buffer.from(callbackState)
+  return (
+    browserStateBytes.length === callbackStateBytes.length &&
+    timingSafeEqual(browserStateBytes, callbackStateBytes)
+  )
 }
 
 async function exchangeCode(
@@ -281,7 +302,14 @@ export function createAuthRoute(db: Db, config: OAuthConfig, options: AuthRouteO
   for (const provider of ['github', 'google'] as const) {
     auth.get(`/${provider}`, async (c) => {
       try {
-        const url = await createOAuthAuthorizationUrl(db, config, provider)
+        const { state, url } = await createOAuthAuthorizationUrl(db, config, provider)
+        setCookie(c, oauthStateCookieName(provider), state, {
+          httpOnly: true,
+          secure: true,
+          sameSite: 'Lax',
+          path: oauthStateCookiePath(provider),
+          maxAge: OAUTH_STATE_MAX_AGE_SECONDS,
+        })
         return c.redirect(url)
       } catch (error) {
         console.error(`${provider} OAuth initialization failed`, error)
@@ -297,6 +325,16 @@ export function createAuthRoute(db: Db, config: OAuthConfig, options: AuthRouteO
       if (!code || !state) {
         return c.json({ error: 'OAuth code and state are required' }, 400)
       }
+
+      const browserState = getCookie(c, oauthStateCookieName(provider))
+      if (!matchesBrowserState(browserState, state)) {
+        return c.json({ error: 'Invalid or expired OAuth state' }, 400)
+      }
+
+      deleteCookie(c, oauthStateCookieName(provider), {
+        secure: true,
+        path: oauthStateCookiePath(provider),
+      })
 
       try {
         const session = await handleOAuthCallback(db, config, fetchProvider, provider, code, state)

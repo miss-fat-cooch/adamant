@@ -188,6 +188,78 @@ describe('OAuth routes', () => {
     })
   })
 
+  it('binds the authorization state to the initiating browser', async () => {
+    let storedState: string | undefined
+    const database = {
+      insert: () => ({
+        values: async (value: { state: string }) => {
+          storedState = value.state
+        },
+      }),
+    } as unknown as Db
+    const app = createAuthRoute(database, {
+      github: {
+        clientId: 'client',
+        clientSecret: 'secret',
+        redirectUri: 'http://localhost/callback',
+      },
+    })
+
+    const response = await app.request('/github')
+    const location = new URL(response.headers.get('location') ?? '')
+    const state = location.searchParams.get('state')
+    const cookie = response.headers.get('set-cookie')
+
+    assert.equal(response.status, 302)
+    assert.equal(state, storedState)
+    assert.match(cookie ?? '', new RegExp(`adamant_oauth_github_state=${state}`))
+    assert.match(cookie ?? '', /HttpOnly/i)
+    assert.match(cookie ?? '', /Secure/i)
+    assert.match(cookie ?? '', /SameSite=Lax/i)
+    assert.match(cookie ?? '', /Path=\/auth\/github\/callback/i)
+  })
+
+  it('rejects callbacks not bound to the initiating browser before consuming state', async () => {
+    let stateConsumptionAttempts = 0
+    let providerRequests = 0
+    const database = {
+      delete: () => {
+        stateConsumptionAttempts += 1
+        return {
+          where: () => ({
+            returning: async () => [{ id: 'state-1' }],
+          }),
+        }
+      },
+    } as unknown as Db
+    const app = createAuthRoute(
+      database,
+      {
+        github: {
+          clientId: 'client',
+          clientSecret: 'secret',
+          redirectUri: 'http://localhost/callback',
+        },
+      },
+      {
+        fetch: async () => {
+          providerRequests += 1
+          return Response.json({ access_token: 'provider-token' })
+        },
+      },
+    )
+
+    const missingCookie = await app.request('/github/callback?code=code&state=state')
+    const mismatchedCookie = await app.request('/github/callback?code=code&state=state', {
+      headers: { Cookie: 'adamant_oauth_github_state=another-state' },
+    })
+
+    assert.equal(missingCookie.status, 400)
+    assert.equal(mismatchedCookie.status, 400)
+    assert.equal(stateConsumptionAttempts, 0)
+    assert.equal(providerRequests, 0)
+  })
+
   it('bounds provider requests and hides callback failures', async () => {
     const database = {
       delete: () => ({
@@ -214,7 +286,9 @@ describe('OAuth routes', () => {
       },
     )
 
-    const response = await app.request('/github/callback?code=code&state=state')
+    const response = await app.request('/github/callback?code=code&state=state', {
+      headers: { Cookie: 'adamant_oauth_github_state=state' },
+    })
     assert.ok(requestSignal instanceof AbortSignal)
     assert.equal(response.status, 500)
     assert.deepEqual(await response.json(), {
@@ -270,14 +344,16 @@ describe('OAuth routes', () => {
       },
     )
 
-    const response = await app.request('/github/callback?code=code&state=state')
+    const response = await app.request('/github/callback?code=code&state=state', {
+      headers: { Cookie: 'adamant_oauth_github_state=state' },
+    })
     const cookie = response.headers.get('set-cookie')
     const body = await response.text()
 
     assert.equal(response.status, 200)
     assert.equal(response.headers.get('cache-control'), 'no-store')
     assert.deepEqual(JSON.parse(body), { authenticated: true })
-    assert.match(cookie ?? '', /^adamant_session=/)
+    assert.match(cookie ?? '', /adamant_session=/)
     assert.match(cookie ?? '', /HttpOnly/i)
     assert.match(cookie ?? '', /Secure/i)
     assert.match(cookie ?? '', /SameSite=Lax/i)
