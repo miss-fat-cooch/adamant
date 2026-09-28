@@ -6,6 +6,24 @@ Hosted backend (GitHub App + worker) plus a CLI that stays connected to it.
 Phase 1:
 [docs/phase-1-tasks.md](docs/phase-1-tasks.md).
 
+## Why “Adamant”?
+
+The name **Adamant** is inspired by Wolverine’s adamantium claws and skeleton. Adamantium makes
+him nearly indestructible: it gives him extraordinary strength, turns his claws into unstoppable
+weapons, and makes him feel almost invincible. A flawless upgrade—apart from the minor
+inconvenience that it slowly poisons him and, in _Logan_, contributes to his death.
+
+AI carries a similar contradiction. It can make us feel superhuman—helping us write faster, solve
+harder problems, build ambitious ideas, and confidently generate 500 lines of code we only
+_mostly_ understand. But when we depend on it for every answer, it can quietly weaken the abilities
+it is supposed to enhance: independent thought, curiosity, problem-solving, and creativity.
+
+That is why we chose **Adamant**. It represents immense power, while reminding us that every
+powerful tool has a cost when used without restraint—especially when “just one quick prompt”
+somehow becomes our entire thinking process.
+
+**Use the power. Don’t let the power use you.**
+
 ## Requirements
 
 - Node.js >= 22.12
