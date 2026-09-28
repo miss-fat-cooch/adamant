@@ -1,4 +1,5 @@
 import type { Context, Next } from 'hono'
+import { getCookie } from 'hono/cookie'
 import { timingSafeEqual } from 'node:crypto'
 
 import { type Db } from '../../db/client.ts'
@@ -8,6 +9,8 @@ export type AuthVariables = {
   userId: string
   sessionId: string
 }
+
+export const SESSION_COOKIE_NAME = 'adamant_session'
 
 export type AuthMiddlewareOptions = {
   database?: Db
@@ -40,6 +43,7 @@ export function createAuthMiddleware(options: AuthMiddlewareOptions = {}) {
     const token =
       c.req.header('ADAMANT_SESSION') ??
       readBearerToken(c.req.header('Authorization')) ??
+      getCookie(c, SESSION_COOKIE_NAME) ??
       c.req.query('session')
 
     if (!token) {

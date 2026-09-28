@@ -51,6 +51,33 @@ describe('session authentication', () => {
     assert.equal(authenticatedUserId, 'user-1')
   })
 
+  it('accepts the HttpOnly browser-session cookie', async () => {
+    let authenticatedToken: string | undefined
+    const store = {
+      create: async () => {
+        throw new Error('not used')
+      },
+      list: async () => [],
+      detail: async () => null,
+    } satisfies RunApiStore
+    const app = createRunsRoute(
+      store,
+      createAuthMiddleware({
+        authenticate: async (token) => {
+          authenticatedToken = token
+          return { sessionId: 'session-1', userId: 'user-1' }
+        },
+      }),
+    )
+
+    const response = await app.request('/', {
+      headers: { Cookie: 'adamant_session=cookie-token' },
+    })
+
+    assert.equal(response.status, 200)
+    assert.equal(authenticatedToken, 'cookie-token')
+  })
+
   it('keeps the seeded Phase 1 session as a database-free fallback', async () => {
     let authenticatedUserId: string | undefined
     const store = {
@@ -193,5 +220,67 @@ describe('OAuth routes', () => {
     assert.deepEqual(await response.json(), {
       error: 'OAuth authentication failed',
     })
+  })
+
+  it('hands the session to browsers only through a non-cacheable HttpOnly cookie', async () => {
+    const database = {
+      delete: () => ({
+        where: () => ({
+          returning: async () => [{ id: 'state-1' }],
+        }),
+      }),
+      select: () => ({
+        from: () => ({
+          where: () => ({
+            limit: async () => [{ userId: 'user-1' }],
+          }),
+        }),
+      }),
+      update: () => ({
+        set: () => ({
+          where: async () => {},
+        }),
+      }),
+      insert: () => ({
+        values: () => ({
+          returning: async () => [{ id: 'session-1' }],
+        }),
+      }),
+    } as unknown as Db
+    const providerResponses = [
+      Response.json({ access_token: 'provider-token' }),
+      Response.json({ id: 123, login: 'octocat' }),
+      Response.json([]),
+    ]
+    const app = createAuthRoute(
+      database,
+      {
+        github: {
+          clientId: 'client',
+          clientSecret: 'secret',
+          redirectUri: 'http://localhost/callback',
+        },
+      },
+      {
+        fetch: async () => {
+          const response = providerResponses.shift()
+          if (!response) throw new Error('unexpected provider request')
+          return response
+        },
+      },
+    )
+
+    const response = await app.request('/github/callback?code=code&state=state')
+    const cookie = response.headers.get('set-cookie')
+    const body = await response.text()
+
+    assert.equal(response.status, 200)
+    assert.equal(response.headers.get('cache-control'), 'no-store')
+    assert.deepEqual(JSON.parse(body), { authenticated: true })
+    assert.match(cookie ?? '', /^adamant_session=/)
+    assert.match(cookie ?? '', /HttpOnly/i)
+    assert.match(cookie ?? '', /Secure/i)
+    assert.match(cookie ?? '', /SameSite=Lax/i)
+    assert.doesNotMatch(body, /provider-token/)
   })
 })

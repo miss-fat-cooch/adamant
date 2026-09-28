@@ -1,7 +1,12 @@
 import { Hono } from 'hono'
+import { deleteCookie, setCookie } from 'hono/cookie'
 
 import { type Db } from '../../db/client.ts'
-import { createAuthMiddleware, type AuthVariables } from '../middleware/auth.ts'
+import {
+  createAuthMiddleware,
+  SESSION_COOKIE_NAME,
+  type AuthVariables,
+} from '../middleware/auth.ts'
 import {
   consumeOAuthState,
   createOAuthState,
@@ -13,6 +18,7 @@ import {
 } from '../services/authService.ts'
 
 const OAUTH_REQUEST_TIMEOUT_MS = 10_000
+const SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 
 export type OAuthProviderConfig = {
   clientId: string
@@ -30,6 +36,7 @@ export type AuthRouteOptions = {
 }
 
 class OAuthConfigurationError extends Error {}
+class InvalidOAuthStateError extends Error {}
 
 function getProviderConfig(config: OAuthConfig, provider: OAuthProvider): OAuthProviderConfig {
   const providerConfig = config[provider]
@@ -243,7 +250,7 @@ async function handleOAuthCallback(
   const validState = await consumeOAuthState(db, provider, state)
 
   if (!validState) {
-    return Response.json({ error: 'Invalid or expired OAuth state' }, { status: 400 })
+    throw new InvalidOAuthStateError()
   }
 
   const accessToken = await exchangeCode(fetchProvider, config, provider, code)
@@ -259,9 +266,7 @@ async function handleOAuthCallback(
 
   const session = await createSession(db, userId)
 
-  return Response.json({
-    token: session.token,
-  })
+  return session
 }
 
 function oauthFailureStatus(error: unknown): 500 | 503 {
@@ -285,6 +290,7 @@ export function createAuthRoute(db: Db, config: OAuthConfig, options: AuthRouteO
     })
 
     auth.get(`/${provider}/callback`, async (c) => {
+      c.header('Cache-Control', 'no-store')
       const code = c.req.query('code')
       const state = c.req.query('state')
 
@@ -293,9 +299,20 @@ export function createAuthRoute(db: Db, config: OAuthConfig, options: AuthRouteO
       }
 
       try {
-        return await handleOAuthCallback(db, config, fetchProvider, provider, code, state)
+        const session = await handleOAuthCallback(db, config, fetchProvider, provider, code, state)
+        setCookie(c, SESSION_COOKIE_NAME, session.token, {
+          httpOnly: true,
+          secure: true,
+          sameSite: 'Lax',
+          path: '/',
+          maxAge: SESSION_MAX_AGE_SECONDS,
+        })
+        return c.json({ authenticated: true })
       } catch (error) {
         console.error(`${provider} OAuth callback failed`, error)
+        if (error instanceof InvalidOAuthStateError) {
+          return c.json({ error: 'Invalid or expired OAuth state' }, 400)
+        }
         return c.json({ error: 'OAuth authentication failed' }, oauthFailureStatus(error))
       }
     })
@@ -305,6 +322,11 @@ export function createAuthRoute(db: Db, config: OAuthConfig, options: AuthRouteO
   auth.post('/logout', async (c) => {
     try {
       await revokeSession(db, c.get('sessionId'))
+      deleteCookie(c, SESSION_COOKIE_NAME, {
+        secure: true,
+        path: '/',
+      })
+      c.header('Cache-Control', 'no-store')
       return c.json({ message: 'Logged out successfully' })
     } catch (error) {
       console.error('Failed to logout', error)
@@ -314,6 +336,7 @@ export function createAuthRoute(db: Db, config: OAuthConfig, options: AuthRouteO
 
   auth.use('/me', requireSession)
   auth.get('/me', async (c) => {
+    c.header('Cache-Control', 'no-store')
     try {
       const user = await getUserAuthInfo(db, c.get('userId'))
       return user ? c.json({ user }) : c.json({ error: 'User not found' }, 404)

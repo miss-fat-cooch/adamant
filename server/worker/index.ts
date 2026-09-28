@@ -43,6 +43,24 @@ export type GraphStepDependencies = {
   checkpointer?: BaseCheckpointSaver
 }
 
+const OAUTH_STATE_BATCH_SIZE = 1_000
+const OAUTH_STATE_MAX_BATCHES = 50
+
+export async function drainExpiredOAuthStates(deleteBatch: () => Promise<number>): Promise<number> {
+  let deleted = 0
+
+  for (let batch = 0; batch < OAUTH_STATE_MAX_BATCHES; batch += 1) {
+    const count = await deleteBatch()
+    deleted += count
+
+    if (count < OAUTH_STATE_BATCH_SIZE) {
+      break
+    }
+  }
+
+  return deleted
+}
+
 export async function graphStep(
   payload: unknown,
   helpers: GraphStepHelpers,
@@ -145,7 +163,7 @@ async function main() {
         await graphStep(payload, helpers, deps)
       },
       cleanup_oauth_states: async (_payload, helpers) => {
-        const deleted = await deleteExpiredOAuthStates(db)
+        const deleted = await drainExpiredOAuthStates(() => deleteExpiredOAuthStates(db))
         helpers.logger.info('expired OAuth states deleted', { deleted })
       },
     },

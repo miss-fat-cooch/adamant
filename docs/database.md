@@ -224,8 +224,9 @@ case-insensitive `users_email_uidx` index.
 
 Single-use CSRF state for an OAuth authorization request. Each random state is unique and expires
 after 15 minutes. Callback consumption is one atomic `DELETE ... RETURNING` guarded by provider and
-expiry, so a state cannot be replayed by concurrent callbacks. The worker deletes up to 1,000
-expired rows hourly through the indexed `cleanup_oauth_states` task.
+expiry, so a state cannot be replayed by concurrent callbacks. The worker deletes expired rows
+hourly through the indexed `cleanup_oauth_states` task in batches of 1,000, stopping after a
+partial batch or 50 batches.
 
 | Column       | Type        | Constraints                      |
 | ------------ | ----------- | -------------------------------- |
