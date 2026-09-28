@@ -22,6 +22,13 @@
       "when": 1790502813541,
       "tag": "0002_parallel_rage",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1790573575380,
+      "tag": "0003_thick_vin_gonzales",
+      "breakpoints": true
     }
   ]
 }

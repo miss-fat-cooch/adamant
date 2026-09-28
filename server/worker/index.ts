@@ -6,6 +6,7 @@ import { run } from 'graphile-worker'
 import { compileOpenAiHealGraph, type OpenAiLlmOptions } from '../agent/index.ts'
 import { type RunRecorder } from '../agent/recorder.ts'
 import { type GitProvider, type SandboxProvider } from '../agent/deps.ts'
+import { deleteExpiredOAuthStates } from '../api/services/authService.ts'
 import { createRunProviders } from './providers.ts'
 import { createRunStore, createWorkerDb, type HealRun } from './runs.ts'
 
@@ -138,9 +139,14 @@ async function main() {
   const runner = await run({
     connectionString,
     concurrency: 1,
+    crontab: '0 * * * * cleanup_oauth_states',
     taskList: {
       graph_step: async (payload, helpers) => {
         await graphStep(payload, helpers, deps)
+      },
+      cleanup_oauth_states: async (_payload, helpers) => {
+        const deleted = await deleteExpiredOAuthStates(db)
+        helpers.logger.info('expired OAuth states deleted', { deleted })
       },
     },
   })

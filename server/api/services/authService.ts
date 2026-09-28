@@ -1,14 +1,9 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 
-import { and, eq } from 'drizzle-orm'
+import { and, eq, gt, sql } from 'drizzle-orm'
 
-import type { Db } from '../../db/client.ts'
-import {
-  oauthStates,
-  sessions,
-  userIdentities,
-  users,
-} from '../../db/schema/index.ts'
+import { type Db } from '../../db/client.ts'
+import { oauthStates, sessions, userIdentities, users } from '../../db/schema/index.ts'
 
 export type OAuthProvider = 'github' | 'google'
 
@@ -40,10 +35,7 @@ function generateUsername(provider: OAuthProvider, username: string): string {
   return `${provider}_${username}`
 }
 
-export async function createOAuthState(
-  db: Db,
-  provider: OAuthProvider,
-): Promise<string> {
+export async function createOAuthState(db: Db, provider: OAuthProvider): Promise<string> {
   const state = generateOAuthState()
   const expiresAt = new Date(Date.now() + 15 * 60 * 1000)
 
@@ -63,36 +55,41 @@ export async function consumeOAuthState(
   provider: OAuthProvider,
   state: string,
 ): Promise<boolean> {
-  const result = await db
-    .select({
-      id: oauthStates.id,
-    })
-    .from(oauthStates)
+  const deleted = await db
+    .delete(oauthStates)
     .where(
       and(
         eq(oauthStates.state, state),
         eq(oauthStates.provider, provider),
+        gt(oauthStates.expiresAt, sql`now()`),
       ),
     )
-    .limit(1)
+    .returning({ id: oauthStates.id })
 
-  const storedState = result[0]
+  return deleted.length > 0
+}
 
-  if (!storedState) {
-    return false
-  }
-
-  await db
-    .delete(oauthStates)
-    .where(eq(oauthStates.id, storedState.id))
-
-  return true
+export async function deleteExpiredOAuthStates(db: Db): Promise<number> {
+  const result = await db.execute(sql`
+    with expired as (
+      select id
+      from oauth_states
+      where expires_at < now()
+      order by expires_at
+      limit 1000
+    )
+    delete from oauth_states
+    using expired
+    where oauth_states.id = expired.id
+  `)
+  return result.rowCount ?? 0
 }
 
 export async function upsertOAuthIdentity(
   db: Db,
   input: OAuthIdentityInput,
 ): Promise<{ userId: string }> {
+  const normalizedEmail = input.email?.trim().toLowerCase()
   const existingIdentity = await db
     .select({
       userId: userIdentities.userId,
@@ -112,7 +109,7 @@ export async function upsertOAuthIdentity(
     await db
       .update(userIdentities)
       .set({
-        email: input.email ?? null,
+        email: normalizedEmail ?? null,
         updatedAt: new Date(),
       })
       .where(
@@ -125,48 +122,83 @@ export async function upsertOAuthIdentity(
     return { userId: identity.userId }
   }
 
-  let userId: string | undefined
+  return db.transaction(async (tx) => {
+    let userId: string | undefined
+    let createdUserId: string | undefined
 
-  if (input.email) {
-    const existingUser = await db
-      .select({
-        id: users.id,
+    if (normalizedEmail) {
+      const existingUser = await tx
+        .select({ id: users.id })
+        .from(users)
+        .where(sql`lower(${users.email}) = ${normalizedEmail}`)
+        .limit(1)
+      userId = existingUser[0]?.id
+    }
+
+    if (!userId) {
+      const createdUser = await tx
+        .insert(users)
+        .values({
+          username: generateUsername(input.provider, input.username),
+          email: normalizedEmail ?? null,
+        })
+        .onConflictDoNothing()
+        .returning({ id: users.id })
+      createdUserId = createdUser[0]?.id
+      userId = createdUserId
+    }
+
+    if (!userId && normalizedEmail) {
+      const concurrentUser = await tx
+        .select({ id: users.id })
+        .from(users)
+        .where(sql`lower(${users.email}) = ${normalizedEmail}`)
+        .limit(1)
+      userId = concurrentUser[0]?.id
+    }
+
+    if (!userId) {
+      throw new Error('Failed to create or find Adamant user')
+    }
+
+    const insertedIdentity = await tx
+      .insert(userIdentities)
+      .values({
+        userId,
+        provider: input.provider,
+        providerUserId: input.providerUserId,
+        email: normalizedEmail ?? null,
       })
-      .from(users)
-      .where(eq(users.email, input.email))
+      .onConflictDoNothing({
+        target: [userIdentities.provider, userIdentities.providerUserId],
+      })
+      .returning({ userId: userIdentities.userId })
+
+    if (insertedIdentity[0]) {
+      return { userId: insertedIdentity[0].userId }
+    }
+
+    if (createdUserId) {
+      await tx.delete(users).where(eq(users.id, createdUserId))
+    }
+
+    const winningIdentity = await tx
+      .select({ userId: userIdentities.userId })
+      .from(userIdentities)
+      .where(
+        and(
+          eq(userIdentities.provider, input.provider),
+          eq(userIdentities.providerUserId, input.providerUserId),
+        ),
+      )
       .limit(1)
 
-    userId = existingUser[0]?.id
-  }
+    if (!winningIdentity[0]) {
+      throw new Error('Failed to create or find OAuth identity')
+    }
 
-  if (!userId) {
-    const username = generateUsername(input.provider, input.username)
-
-    const createdUser = await db
-      .insert(users)
-      .values({
-        username,
-        email: input.email ?? null,
-      })
-      .returning({
-        id: users.id,
-      })
-
-    userId = createdUser[0]?.id
-  }
-
-  if (!userId) {
-    throw new Error('Failed to create or find Adamant user')
-  }
-
-  await db.insert(userIdentities).values({
-    userId,
-    provider: input.provider,
-    providerUserId: input.providerUserId,
-    email: input.email ?? null,
+    return { userId: winningIdentity[0].userId }
   })
-
-  return { userId }
 }
 
 export async function createSession(
@@ -245,10 +277,7 @@ export async function authenticateSession(
   }
 }
 
-export async function revokeSession(
-  db: Db,
-  sessionId: string,
-): Promise<void> {
+export async function revokeSession(db: Db, sessionId: string): Promise<void> {
   await db
     .update(sessions)
     .set({
@@ -291,10 +320,7 @@ export async function getUserAuthInfo(
 
   const providers = identities
     .map((identity) => identity.provider)
-    .filter(
-      (provider): provider is OAuthProvider =>
-        provider === 'github' || provider === 'google',
-    )
+    .filter((provider): provider is OAuthProvider => provider === 'github' || provider === 'google')
 
   return {
     id: user.id,

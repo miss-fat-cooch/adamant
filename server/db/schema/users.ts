@@ -1,13 +1,5 @@
 import { sql } from 'drizzle-orm'
-import {
-  check,
-  index,
-  pgTable,
-  text,
-  timestamp,
-  uniqueIndex,
-  uuid,
-} from 'drizzle-orm/pg-core'
+import { check, index, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core'
 
 /**
  * Adamant user account.
@@ -26,16 +18,13 @@ export const users = pgTable(
 
     email: text('email'),
 
-    createdAt: timestamp('created_at', { withTimezone: true })
-      .notNull()
-      .defaultNow(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 
-    updatedAt: timestamp('updated_at', { withTimezone: true })
-      .notNull()
-      .defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
     uniqueIndex('users_github_user_id_uidx').on(table.githubUserId),
+    uniqueIndex('users_email_uidx').on(sql`lower(${table.email})`),
   ],
 )
 
@@ -60,23 +49,13 @@ export const userIdentities = pgTable(
 
     email: text('email'),
 
-    createdAt: timestamp('created_at', { withTimezone: true })
-      .notNull()
-      .defaultNow(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 
-    updatedAt: timestamp('updated_at', { withTimezone: true })
-      .notNull()
-      .defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [
-    check(
-      'user_identities_provider_check',
-      sql`${table.provider} in ('github', 'google')`,
-    ),
-    uniqueIndex('user_identities_provider_user_id_uidx').on(
-      table.provider,
-      table.providerUserId,
-    ),
+    check('user_identities_provider_check', sql`${table.provider} in ('github', 'google')`),
+    uniqueIndex('user_identities_provider_user_id_uidx').on(table.provider, table.providerUserId),
     index('user_identities_user_id_idx').on(table.userId),
   ],
 )
@@ -104,9 +83,7 @@ export const sessions = pgTable(
 
     tokenHash: text('token_hash').notNull(),
 
-    createdAt: timestamp('created_at', { withTimezone: true })
-      .notNull()
-      .defaultNow(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 
     expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
 

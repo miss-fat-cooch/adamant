@@ -1,11 +1,12 @@
 import { Hono } from 'hono'
 
+import { createDb, type Db } from '../db/client.ts'
 import { createApp, resourceNames } from './app.ts'
-import { authMiddleware } from './middleware/auth.ts'
+import { createAuthMiddleware } from './middleware/auth.ts'
 import { activity } from './routes/activity.ts'
-import { auth } from './routes/auth.ts'
+import { createAuthRoute, type OAuthConfig } from './routes/auth.ts'
 import { createRunsRoute } from './routes/runs.ts'
-import { type RunApiStore } from './services/runStore.ts'
+import { createPostgresRunApiStore, type RunApiStore } from './services/runStore.ts'
 import { github } from './webhooks/github.ts'
 
 /**
@@ -16,8 +17,38 @@ import { github } from './webhooks/github.ts'
  * direct tests. GitHub calls /webhooks/github with its own signature, and
  * /health stays open for infra checks.
  */
-export function createServerApp(runStore?: RunApiStore) {
+export type ServerOptions = {
+  database?: Db
+  oauthConfig?: OAuthConfig
+  fetch?: typeof globalThis.fetch
+}
+
+function readOAuthConfig(): OAuthConfig {
+  const provider = (name: 'GITHUB' | 'GOOGLE') => {
+    const clientId = process.env[`${name}_OAUTH_CLIENT_ID`]
+    const clientSecret = process.env[`${name}_OAUTH_CLIENT_SECRET`]
+    const redirectUri = process.env[`${name}_OAUTH_REDIRECT_URI`]
+    return clientId && clientSecret && redirectUri
+      ? { clientId, clientSecret, redirectUri }
+      : undefined
+  }
+
+  const github = provider('GITHUB')
+  const google = provider('GOOGLE')
+  return {
+    ...(github ? { github } : {}),
+    ...(google ? { google } : {}),
+  }
+}
+
+export function createServerApp(runStore?: RunApiStore, options: ServerOptions = {}) {
   const app = new Hono()
+  const database =
+    options.database ?? (process.env.DATABASE_URL ? createDb(process.env.DATABASE_URL) : undefined)
+  const authMiddleware = createAuthMiddleware({
+    ...(database ? { database } : {}),
+  })
+  const resolvedRunStore = runStore ?? (database ? createPostgresRunApiStore(database) : undefined)
 
   for (const name of resourceNames) {
     app.use(`/${name}`, authMiddleware)
@@ -27,11 +58,18 @@ export function createServerApp(runStore?: RunApiStore) {
   app.use('/activity', authMiddleware)
   app.use('/activity/*', authMiddleware)
 
-  if (runStore || process.env.DATABASE_URL) {
-    app.route('/runs', createRunsRoute(runStore))
+  if (resolvedRunStore) {
+    app.route('/runs', createRunsRoute(resolvedRunStore, authMiddleware))
   }
 
-  app.route('/auth', auth)
+  if (database) {
+    app.route(
+      '/auth',
+      createAuthRoute(database, options.oauthConfig ?? readOAuthConfig(), {
+        ...(options.fetch ? { fetch: options.fetch } : {}),
+      }),
+    )
+  }
 
   createApp(undefined, app)
 

@@ -1,11 +1,8 @@
-import { existsSync, readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
-
 import { Hono } from 'hono'
 
-import { createDb } from '../../db/client.ts'
+import { type Db } from '../../db/client.ts'
+import { createAuthMiddleware, type AuthVariables } from '../middleware/auth.ts'
 import {
-  authenticateSession,
   consumeOAuthState,
   createOAuthState,
   createSession,
@@ -15,111 +12,44 @@ import {
   type OAuthProvider,
 } from '../services/authService.ts'
 
-// .env file ko automatically locate karke process.env me load karne ka logic
-function ensureEnvLoaded() {
-  const searchDirs = [
-    process.cwd(),
-    resolve(process.cwd(), '..'),
-    resolve(process.cwd(), '../..'),
-    'C:/Users/shrey/adamant',
-  ]
+const OAUTH_REQUEST_TIMEOUT_MS = 10_000
 
-  for (const dir of searchDirs) {
-    const envFile = resolve(dir, '.env')
-    if (existsSync(envFile)) {
-      try {
-        const raw = readFileSync(envFile, 'utf8')
-        for (const line of raw.split(/\r?\n/)) {
-          const trimmed = line.trim()
-          if (!trimmed || trimmed.startsWith('#')) continue
-          const eq = trimmed.indexOf('=')
-          if (eq !== -1) {
-            const key = trimmed.slice(0, eq).trim()
-            let val = trimmed.slice(eq + 1).trim()
-            if (
-              (val.startsWith('"') && val.endsWith('"')) ||
-              (val.startsWith("'") && val.endsWith("'"))
-            ) {
-              val = val.slice(1, -1)
-            }
-            process.env[key] = val
-          }
-        }
-        break
-      } catch (e) {
-        console.error('Failed to parse .env file:', e)
-      }
-    }
+export type OAuthProviderConfig = {
+  clientId: string
+  clientSecret: string
+  redirectUri: string
+}
+
+export type OAuthConfig = {
+  github?: OAuthProviderConfig
+  google?: OAuthProviderConfig
+}
+
+export type AuthRouteOptions = {
+  fetch?: typeof globalThis.fetch
+}
+
+class OAuthConfigurationError extends Error {}
+
+function getProviderConfig(config: OAuthConfig, provider: OAuthProvider): OAuthProviderConfig {
+  const providerConfig = config[provider]
+  if (!providerConfig) {
+    throw new OAuthConfigurationError(`${provider} OAuth is not configured`)
   }
-}
-
-ensureEnvLoaded()
-
-const auth = new Hono()
-
-let db: ReturnType<typeof createDb> | undefined
-
-function getDb() {
-  if (!db) {
-    ensureEnvLoaded()
-
-    const databaseUrl =
-      process.env.DATABASE_URL ||
-      process.env.POSTGRES_URL ||
-      process.env.DB_URL ||
-      'postgresql://adamant:adamant@127.0.0.1:5432/adamant'
-
-    if (!databaseUrl) {
-      throw new Error('DATABASE_URL is required for authentication')
-    }
-
-    db = createDb(databaseUrl)
-  }
-
-  return db
-}
-
-function getRequiredEnv(name: string): string {
-  ensureEnvLoaded()
-  const value = process.env[name]
-
-  if (!value) {
-    throw new Error(`${name} is required for OAuth`)
-  }
-
-  return value
-}
-
-function getOAuthRedirectUri(provider: OAuthProvider): string {
-  return provider === 'github'
-    ? getRequiredEnv('GITHUB_OAUTH_REDIRECT_URI')
-    : getRequiredEnv('GOOGLE_OAUTH_REDIRECT_URI')
-}
-
-function getOAuthClientId(provider: OAuthProvider): string {
-  return provider === 'github'
-    ? getRequiredEnv('GITHUB_OAUTH_CLIENT_ID')
-    : getRequiredEnv('GOOGLE_OAUTH_CLIENT_ID')
-}
-
-function getOAuthClientSecret(provider: OAuthProvider): string {
-  return provider === 'github'
-    ? getRequiredEnv('GITHUB_OAUTH_CLIENT_SECRET')
-    : getRequiredEnv('GOOGLE_OAUTH_CLIENT_SECRET')
+  return providerConfig
 }
 
 async function createOAuthAuthorizationUrl(
+  db: Db,
+  config: OAuthConfig,
   provider: OAuthProvider,
 ): Promise<string> {
-  const database = getDb()
-  const state = await createOAuthState(database, provider)
-
-  const redirectUri = getOAuthRedirectUri(provider)
-  const clientId = getOAuthClientId(provider)
+  const providerConfig = getProviderConfig(config, provider)
+  const state = await createOAuthState(db, provider)
 
   const params = new URLSearchParams({
-    client_id: clientId,
-    redirect_uri: redirectUri,
+    client_id: providerConfig.clientId,
+    redirect_uri: providerConfig.redirectUri,
     state,
   })
 
@@ -137,31 +67,29 @@ async function createOAuthAuthorizationUrl(
 }
 
 async function exchangeCode(
+  fetchProvider: typeof globalThis.fetch,
+  config: OAuthConfig,
   provider: OAuthProvider,
   code: string,
 ): Promise<string> {
-  const clientId = getOAuthClientId(provider)
-  const clientSecret = getOAuthClientSecret(provider)
-  const redirectUri = getOAuthRedirectUri(provider)
+  const providerConfig = getProviderConfig(config, provider)
 
   const body = new URLSearchParams({
-    client_id: clientId,
-    client_secret: clientSecret,
+    client_id: providerConfig.clientId,
+    client_secret: providerConfig.clientSecret,
     code,
-    redirect_uri: redirectUri,
+    redirect_uri: providerConfig.redirectUri,
   })
 
   if (provider === 'github') {
-    const response = await fetch(
-      'https://github.com/login/oauth/access_token',
-      {
-        method: 'POST',
-        headers: {
-          Accept: 'application/json',
-        },
-        body,
+    const response = await fetchProvider('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
       },
-    )
+      body,
+      signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS),
+    })
 
     if (!response.ok) {
       throw new Error('GitHub OAuth token exchange failed')
@@ -174,12 +102,7 @@ async function exchangeCode(
     }
 
     if (!data.access_token) {
-      console.error('GitHub Token Response:', data)
-      throw new Error(
-        data.error_description ||
-          data.error ||
-          'GitHub OAuth token was not returned',
-      )
+      throw new Error(data.error_description || data.error || 'GitHub OAuth token was not returned')
     }
 
     return data.access_token
@@ -187,16 +110,14 @@ async function exchangeCode(
 
   body.set('grant_type', 'authorization_code')
 
-  const response = await fetch(
-    'https://oauth2.googleapis.com/token',
-    {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body,
+  const response = await fetchProvider('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
     },
-  )
+    body,
+    signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS),
+  })
 
   if (!response.ok) {
     throw new Error('Google OAuth token exchange failed')
@@ -209,17 +130,14 @@ async function exchangeCode(
   }
 
   if (!data.access_token) {
-    throw new Error(
-      data.error_description ||
-        data.error ||
-        'Google OAuth token was not returned',
-    )
+    throw new Error(data.error_description || data.error || 'Google OAuth token was not returned')
   }
 
   return data.access_token
 }
 
 async function authenticateOAuthUser(
+  fetchProvider: typeof globalThis.fetch,
   provider: OAuthProvider,
   accessToken: string,
 ): Promise<{
@@ -228,12 +146,13 @@ async function authenticateOAuthUser(
   email?: string
 }> {
   if (provider === 'github') {
-    const userResponse = await fetch('https://api.github.com/user', {
+    const userResponse = await fetchProvider('https://api.github.com/user', {
       headers: {
         Accept: 'application/vnd.github+json',
         Authorization: `Bearer ${accessToken}`,
         'User-Agent': 'Adamant',
       },
+      signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS),
     })
 
     if (!userResponse.ok) {
@@ -251,16 +170,14 @@ async function authenticateOAuthUser(
 
     let verifiedEmail: string | undefined
 
-    const emailsResponse = await fetch(
-      'https://api.github.com/user/emails',
-      {
-        headers: {
-          Accept: 'application/vnd.github+json',
-          Authorization: `Bearer ${accessToken}`,
-          'User-Agent': 'Adamant',
-        },
+    const emailsResponse = await fetchProvider('https://api.github.com/user/emails', {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${accessToken}`,
+        'User-Agent': 'Adamant',
       },
-    )
+      signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS),
+    })
 
     if (emailsResponse.ok) {
       const emails = (await emailsResponse.json()) as Array<{
@@ -270,21 +187,13 @@ async function authenticateOAuthUser(
       }>
 
       const primaryVerifiedEmail = emails.find(
-        (entry) =>
-          entry.email &&
-          entry.verified &&
-          entry.primary,
+        (entry) => entry.email && entry.verified && entry.primary,
       )
 
       const verifiedEmailEntry =
-        primaryVerifiedEmail ??
-        emails.find(
-          (entry) =>
-            entry.email &&
-            entry.verified,
-        )
+        primaryVerifiedEmail ?? emails.find((entry) => entry.email && entry.verified)
 
-      verifiedEmail = verifiedEmailEntry?.email
+      verifiedEmail = verifiedEmailEntry?.email?.trim().toLowerCase()
     }
 
     return {
@@ -294,14 +203,12 @@ async function authenticateOAuthUser(
     }
   }
 
-  const response = await fetch(
-    'https://openidconnect.googleapis.com/v1/userinfo',
-    {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
+  const response = await fetchProvider('https://openidconnect.googleapis.com/v1/userinfo', {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
     },
-  )
+    signal: AbortSignal.timeout(OAUTH_REQUEST_TIMEOUT_MS),
+  })
 
   if (!response.ok) {
     throw new Error('Failed to fetch Google user')
@@ -320,281 +227,101 @@ async function authenticateOAuthUser(
 
   return {
     providerUserId: user.sub,
-    username:
-      user.name ??
-      user.email ??
-      `google_${user.sub}`,
-    ...(user.email_verified && user.email
-      ? { email: user.email }
-      : {}),
+    username: user.name ?? user.email ?? `google_${user.sub}`,
+    ...(user.email_verified && user.email ? { email: user.email.trim().toLowerCase() } : {}),
   }
 }
 
 async function handleOAuthCallback(
+  db: Db,
+  config: OAuthConfig,
+  fetchProvider: typeof globalThis.fetch,
   provider: OAuthProvider,
   code: string,
   state: string,
 ) {
-  const database = getDb()
-
-  const validState = await consumeOAuthState(
-    database,
-    provider,
-    state,
-  )
+  const validState = await consumeOAuthState(db, provider, state)
 
   if (!validState) {
-    return Response.json(
-      { error: 'Invalid or expired OAuth state' },
-      { status: 400 },
-    )
+    return Response.json({ error: 'Invalid or expired OAuth state' }, { status: 400 })
   }
 
-  const accessToken = await exchangeCode(
+  const accessToken = await exchangeCode(fetchProvider, config, provider, code)
+
+  const identity = await authenticateOAuthUser(fetchProvider, provider, accessToken)
+
+  const { userId } = await upsertOAuthIdentity(db, {
     provider,
-    code,
-  )
+    providerUserId: identity.providerUserId,
+    username: identity.username,
+    ...(identity.email ? { email: identity.email } : {}),
+  })
 
-  const identity = await authenticateOAuthUser(
-    provider,
-    accessToken,
-  )
-
-  const { userId } = await upsertOAuthIdentity(
-    database,
-    {
-      provider,
-      providerUserId: identity.providerUserId,
-      username: identity.username,
-      ...(identity.email
-        ? { email: identity.email }
-        : {}),
-    },
-  )
-
-  const session = await createSession(
-    database,
-    userId,
-  )
+  const session = await createSession(db, userId)
 
   return Response.json({
     token: session.token,
   })
 }
 
-auth.get('/github', async (c) => {
-  try {
-    const url =
-      await createOAuthAuthorizationUrl('github')
+function oauthFailureStatus(error: unknown): 500 | 503 {
+  return error instanceof OAuthConfigurationError ? 503 : 500
+}
 
-    return c.redirect(url)
-  } catch (error) {
-    console.error('GitHub OAuth error:', error)
+export function createAuthRoute(db: Db, config: OAuthConfig, options: AuthRouteOptions = {}) {
+  const auth = new Hono<{ Variables: AuthVariables }>()
+  const fetchProvider = options.fetch ?? globalThis.fetch
+  const requireSession = createAuthMiddleware({ database: db })
 
-    const cause = (error as any)?.cause
-
-    return c.json(
-      {
-        error: 'GitHub OAuth error',
-        details: error instanceof Error ? error.message : String(error),
-        cause: cause?.message || cause?.detail || String(cause || ''),
-      },
-      500,
-    )
-  }
-})
-
-auth.get('/github/callback', async (c) => {
-  const code = c.req.query('code')
-  const state = c.req.query('state')
-
-  if (!code || !state) {
-    return c.json(
-      {
-        error:
-          'OAuth code and state are required',
-      },
-      400,
-    )
-  }
-
-  try {
-    return await handleOAuthCallback(
-      'github',
-      code,
-      state,
-    )
-  } catch (error) {
-    console.error('GitHub OAuth callback failed:', error)
-
-    return c.json(
-      {
-        error: 'GitHub authentication failed',
-        details: error instanceof Error ? error.message : String(error),
-      },
-      500,
-    )
-  }
-})
-
-auth.get('/google', async (c) => {
-  try {
-    const url =
-      await createOAuthAuthorizationUrl('google')
-
-    return c.redirect(url)
-  } catch (error) {
-    console.error('Google OAuth error:', error)
-
-    const cause = (error as any)?.cause
-
-    return c.json(
-      {
-        error: 'Google OAuth error',
-        details: error instanceof Error ? error.message : String(error),
-        cause: cause?.message || cause?.detail || String(cause || ''),
-      },
-      500,
-    )
-  }
-})
-
-auth.get('/google/callback', async (c) => {
-  const code = c.req.query('code')
-  const state = c.req.query('state')
-
-  if (!code || !state) {
-    return c.json(
-      {
-        error:
-          'OAuth code and state are required',
-      },
-      400,
-    )
-  }
-
-  try {
-    return await handleOAuthCallback(
-      'google',
-      code,
-      state,
-    )
-  } catch (error) {
-    console.error('Google OAuth callback failed:', error)
-
-    return c.json(
-      {
-        error: 'Google authentication failed',
-        details: error instanceof Error ? error.message : String(error),
-      },
-      500,
-    )
-  }
-})
-
-auth.post('/logout', async (c) => {
-  const token =
-    c.req.query('session') ||
-    c.req.header('ADAMANT_SESSION') ||
-    c.req.header('adamant_session') ||
-    c.req.header('authorization')?.replace(/^Bearer\s+/i, '')
-
-  if (!token) {
-    return c.json(
-      { error: 'Unauthorized', reason: 'No session token provided' },
-      401,
-    )
-  }
-
-  try {
-    const database = getDb()
-
-    const session = await authenticateSession(
-      database,
-      token,
-    )
-
-    if (!session) {
-      return c.json(
-        { error: 'Unauthorized', reason: 'Session not found or already revoked' },
-        401,
-      )
-    }
-
-    await revokeSession(
-      database,
-      session.sessionId,
-    )
-
-    return c.json({
-      message: 'Logged out successfully',
+  for (const provider of ['github', 'google'] as const) {
+    auth.get(`/${provider}`, async (c) => {
+      try {
+        const url = await createOAuthAuthorizationUrl(db, config, provider)
+        return c.redirect(url)
+      } catch (error) {
+        console.error(`${provider} OAuth initialization failed`, error)
+        return c.json({ error: 'OAuth authentication is unavailable' }, oauthFailureStatus(error))
+      }
     })
-  } catch (error) {
-    console.error('Failed to logout:', error)
 
-    return c.json(
-      { error: 'Failed to logout' },
-      500,
-    )
-  }
-})
+    auth.get(`/${provider}/callback`, async (c) => {
+      const code = c.req.query('code')
+      const state = c.req.query('state')
 
-auth.get('/me', async (c) => {
-  const token =
-    c.req.query('session') ||
-    c.req.header('ADAMANT_SESSION') ||
-    c.req.header('adamant_session') ||
-    c.req.header('authorization')?.replace(/^Bearer\s+/i, '')
+      if (!code || !state) {
+        return c.json({ error: 'OAuth code and state are required' }, 400)
+      }
 
-  if (!token) {
-    return c.json(
-      {
-        error: 'Unauthorized',
-        reason: 'Token was not found in header or ?session= query',
-      },
-      401,
-    )
+      try {
+        return await handleOAuthCallback(db, config, fetchProvider, provider, code, state)
+      } catch (error) {
+        console.error(`${provider} OAuth callback failed`, error)
+        return c.json({ error: 'OAuth authentication failed' }, oauthFailureStatus(error))
+      }
+    })
   }
 
-  try {
-    const database = getDb()
-
-    const session = await authenticateSession(
-      database,
-      token,
-    )
-
-    if (!session) {
-      return c.json(
-        {
-          error: 'Unauthorized',
-          reason: 'Session token not found or expired in DB',
-        },
-        401,
-      )
+  auth.use('/logout', requireSession)
+  auth.post('/logout', async (c) => {
+    try {
+      await revokeSession(db, c.get('sessionId'))
+      return c.json({ message: 'Logged out successfully' })
+    } catch (error) {
+      console.error('Failed to logout', error)
+      return c.json({ error: 'Failed to logout' }, 500)
     }
+  })
 
-    const user = await getUserAuthInfo(
-      database,
-      session.userId,
-    )
-
-    if (!user) {
-      return c.json(
-        { error: 'User not found' },
-        404,
-      )
+  auth.use('/me', requireSession)
+  auth.get('/me', async (c) => {
+    try {
+      const user = await getUserAuthInfo(db, c.get('userId'))
+      return user ? c.json({ user }) : c.json({ error: 'User not found' }, 404)
+    } catch (error) {
+      console.error('Failed to load user', error)
+      return c.json({ error: 'Failed to load user' }, 500)
     }
+  })
 
-    return c.json({ user })
-  } catch (error) {
-    console.error('Failed to load user:', error)
-
-    return c.json(
-      { error: 'Failed to load user', details: String(error) },
-      500,
-    )
-  }
-})
-
-export { auth }
+  return auth
+}

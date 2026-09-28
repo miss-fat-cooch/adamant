@@ -1,58 +1,88 @@
 import type { Context, Next } from 'hono'
+import { timingSafeEqual } from 'node:crypto'
 
-import { createDb } from '../../db/client.ts'
-import { authenticateSession } from '../services/authService.ts'
+import { type Db } from '../../db/client.ts'
+import { authenticateSession, type AuthenticatedSession } from '../services/authService.ts'
 
 export type AuthVariables = {
   userId: string
   sessionId: string
 }
 
-let db: ReturnType<typeof createDb> | undefined
-
-function getDb() {
-  if (!db) {
-    const databaseUrl = process.env.DATABASE_URL
-
-    if (!databaseUrl) {
-      throw new Error('DATABASE_URL is required for session authentication')
-    }
-
-    db = createDb(databaseUrl)
+export type AuthMiddlewareOptions = {
+  database?: Db
+  authenticate?: (token: string) => Promise<AuthenticatedSession | null>
+  legacySession?: {
+    token: string
+    userId: string
   }
-
-  return db
 }
 
-export async function authMiddleware(c: Context, next: Next) {
-  const sessionHeader = c.req.header('ADAMANT_SESSION')
-  const sessionQuery = c.req.query('session')
+function safeEqual(a: string, b: string): boolean {
+  const bufferA = Buffer.from(a)
+  const bufferB = Buffer.from(b)
+  return bufferA.length === bufferB.length && timingSafeEqual(bufferA, bufferB)
+}
 
-  const token = sessionHeader ?? sessionQuery
+function readBearerToken(header: string | undefined): string | undefined {
+  const match = header?.match(/^Bearer\s+(\S+)$/i)
+  return match?.[1]
+}
 
-  if (!token) {
-    return c.json({ error: 'Unauthorized' }, 401)
-  }
+export function createAuthMiddleware(options: AuthMiddlewareOptions = {}) {
+  const database = options.database
+  const configuredLegacySession = options.legacySession
+  const authenticate =
+    options.authenticate ??
+    (database ? (token: string) => authenticateSession(database, token) : undefined)
 
-  try {
-    const database = getDb()
-    const session = await authenticateSession(database, token)
+  return async function authMiddleware(c: Context, next: Next) {
+    const token =
+      c.req.header('ADAMANT_SESSION') ??
+      readBearerToken(c.req.header('Authorization')) ??
+      c.req.query('session')
 
-    if (!session) {
+    if (!token) {
       return c.json({ error: 'Unauthorized' }, 401)
     }
 
-    c.set('userId', session.userId)
-    c.set('sessionId', session.sessionId)
+    try {
+      if (authenticate) {
+        const session = await authenticate(token)
 
-    await next()
-  } catch (error) {
-    console.error(
-      error instanceof Error
-        ? error.message
-        : 'Failed to authenticate session',
-    )
+        if (!session) {
+          return c.json({ error: 'Unauthorized' }, 401)
+        }
 
-    return c.json({ error: 'Server misconfiguration' }, 500)
+        c.set('userId', session.userId)
+        c.set('sessionId', session.sessionId)
+        await next()
+        return
+      }
+
+      const legacySession =
+        configuredLegacySession ??
+        (process.env.ADAMANT_SESSION_SECRET && process.env.ADAMANT_SEED_USER_ID
+          ? {
+              token: process.env.ADAMANT_SESSION_SECRET,
+              userId: process.env.ADAMANT_SEED_USER_ID,
+            }
+          : undefined)
+
+      if (!legacySession) {
+        throw new Error('No session authentication method is configured')
+      }
+
+      if (!safeEqual(token, legacySession.token)) {
+        return c.json({ error: 'Unauthorized' }, 401)
+      }
+
+      c.set('userId', legacySession.userId)
+      c.set('sessionId', 'phase-1-seeded-session')
+      await next()
+    } catch (error) {
+      console.error('Failed to authenticate session', error)
+      return c.json({ error: 'Server misconfiguration' }, 500)
+    }
   }
 }
