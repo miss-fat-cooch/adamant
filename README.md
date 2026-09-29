@@ -281,4 +281,5 @@ You still own what you submit.
 
 ## License
 
-[MIT](LICENSE) © Aditya Vaish
+[MIT](LICENSE) © vaishcodescape
+
