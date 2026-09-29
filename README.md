@@ -35,8 +35,9 @@ flowchart LR
    dies resumes from its checkpoint instead of starting the run again.
 4. The agent reads the Actions logs, triages them into evidence, and commits a candidate patch in
    a per-run worktree. Nothing is pushed yet.
-5. The sandbox installs and tests the candidate in a container with the network off, then writes
-   `pass` or `fail`. A fail goes back to diagnose, up to a capped number of attempts.
+5. The sandbox installs the candidate's dependencies with the network on, runs the tests with it
+   off, and writes `pass` or `fail`. A fail goes back to diagnose, up to a capped number of
+   attempts.
 6. On a pass — and only then — the agent pushes `refs/heads/adamant/{run_id}`, opens a PR stating
    cause, evidence, fix, what was verified and what was not, and merges that PR.
 
